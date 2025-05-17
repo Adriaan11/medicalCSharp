@@ -18,6 +18,43 @@ public class HumanDiagnosisController : ControllerBase
         _ai = ai;
     }
 
+    private async Task<ActionResult?> ValidatePasswordAsync(string password)
+    {
+        if (string.IsNullOrWhiteSpace(password) ||
+            !await DatabaseHelper.PasswordExistsAsync(password))
+            return Unauthorized("Invalid password");
+        return null;
+    }
+
+    private ActionResult? ValidateNotes(string notes)
+        => string.IsNullOrWhiteSpace(notes)
+            ? BadRequest("Request 'clinical_notes' is empty")
+            : null;
+
+    private ActionResult? ValidateNotesAndDiagnosis(string notes, string diagnosis)
+        => string.IsNullOrWhiteSpace(notes) || string.IsNullOrWhiteSpace(diagnosis)
+            ? BadRequest("Missing notes or diagnosis.")
+            : null;
+
+    private async Task<string> CallOpenAiAsync(
+        string systemPrompt,
+        string userPrompt,
+        float temperature = 0.2f,
+        ChatCompletionsFunctionToolDefinition? tool = null,
+        string? functionName = null)
+    {
+        var tools = tool == null ? null : new[] { tool };
+        return await _ai.GetChatCompletionAsync(
+            new[]
+            {
+                new ChatMessage(ChatRole.System, systemPrompt),
+                new ChatMessage(ChatRole.User, userPrompt)
+            },
+            temperature,
+            tools,
+            functionName);
+    }
+
     private const string HUMAN_GUIDELINES = """
 Human Quick Reference:
 1. Severe sepsis indicators: altered mental status, hypotension, elevated lactate.
@@ -199,39 +236,30 @@ Return via the manage_non_medical_human function.
     [HttpPost("diagnose_human")]
     public async Task<ActionResult<HumanDiagnosisResponse>> DiagnoseHumanAsync(HumanDiagnosisRequest req)
     {
-        if (!await DatabaseHelper.PasswordExistsAsync(req.Password))
-            return Unauthorized("Invalid password");
-        if (string.IsNullOrWhiteSpace(req.ClinicalNotes))
-            return BadRequest("Request 'clinical_notes' is empty");
+        if (await ValidatePasswordAsync(req.Password) is ActionResult err)
+            return err;
+        if (ValidateNotes(req.ClinicalNotes) is ActionResult bad)
+            return bad;
         try
         {
-            var summaryJson = await _ai.GetChatCompletionAsync(
-                new[]
-                {
-                    new ChatMessage(ChatRole.System, SYS_EXTRACT),
-                    new ChatMessage(ChatRole.User, req.ClinicalNotes)
-                },
-                tools: new[] { EXTRACT_TOOL_HUMAN },
+            var summaryJson = await CallOpenAiAsync(
+                SYS_EXTRACT,
+                req.ClinicalNotes,
+                tool: EXTRACT_TOOL_HUMAN,
                 functionName: "extract_features_human");
             using var summaryDoc = JsonDocument.Parse(summaryJson);
-            var diagJson = await _ai.GetChatCompletionAsync(
-                new[]
-                {
-                    new ChatMessage(ChatRole.System, SYS_DIAGNOSE),
-                    new ChatMessage(ChatRole.User, summaryJson)
-                },
+            var diagJson = await CallOpenAiAsync(
+                SYS_DIAGNOSE,
+                summaryJson,
                 0.25f,
-                new[] { DIAGNOSE_TOOL_HUMAN },
+                DIAGNOSE_TOOL_HUMAN,
                 "diagnose_human");
             var preds = JsonSerializer.Deserialize<HumanDiagnosisResponse>(diagJson)?.Diagnoses ?? new();
-            var refineJson = await _ai.GetChatCompletionAsync(
-                new[]
-                {
-                    new ChatMessage(ChatRole.System, META_REVIEW),
-                    new ChatMessage(ChatRole.User, $"ORIGINAL_CLINICAL_NOTE:\n{req.ClinicalNotes}\n\nINITIAL_DIFFERENTIAL_JSON:\n{JsonSerializer.Serialize(new HumanDiagnosisResponse { Diagnoses = preds })}")
-                },
+            var refineJson = await CallOpenAiAsync(
+                META_REVIEW,
+                $"ORIGINAL_CLINICAL_NOTE:\n{req.ClinicalNotes}\n\nINITIAL_DIFFERENTIAL_JSON:\n{JsonSerializer.Serialize(new HumanDiagnosisResponse { Diagnoses = preds })}",
                 0.2f,
-                new[] { DIAGNOSE_TOOL_HUMAN },
+                DIAGNOSE_TOOL_HUMAN,
                 "diagnose_human");
             preds = JsonSerializer.Deserialize<HumanDiagnosisResponse>(refineJson)?.Diagnoses ?? new();
             preds = ApplyHeuristics(preds, summaryDoc.RootElement);
@@ -248,20 +276,17 @@ Return via the manage_non_medical_human function.
     [HttpPost("human_investigations")]
     public async Task<ActionResult<HumanInvestigationResponse>> InvestigationsAsync(HumanInvestigationRequest req)
     {
-        if (!await DatabaseHelper.PasswordExistsAsync(req.Password))
-            return Unauthorized("Invalid password");
-        if (string.IsNullOrWhiteSpace(req.ClinicalNotes) || string.IsNullOrWhiteSpace(req.Diagnosis))
-            return BadRequest("Missing notes or diagnosis.");
+        if (await ValidatePasswordAsync(req.Password) is ActionResult err)
+            return err;
+        if (ValidateNotesAndDiagnosis(req.ClinicalNotes, req.Diagnosis) is ActionResult bad)
+            return bad;
         try
         {
             var userBlob = $"CLINICAL_NOTES:\n{req.ClinicalNotes}\n\nDIAGNOSIS: {req.Diagnosis}";
-            var resultJson = await _ai.GetChatCompletionAsync(
-                new[]
-                {
-                    new ChatMessage(ChatRole.System, INVESTIGATION_SYS),
-                    new ChatMessage(ChatRole.User, userBlob)
-                },
-                tools: new[] { INVESTIGATE_TOOL_HUMAN },
+            var resultJson = await CallOpenAiAsync(
+                INVESTIGATION_SYS,
+                userBlob,
+                tool: INVESTIGATE_TOOL_HUMAN,
                 functionName: "investigate_human");
             var parsed = JsonSerializer.Deserialize<HumanInvestigationResponse>(resultJson);
             var respJson = JsonSerializer.Serialize(parsed);
@@ -277,20 +302,17 @@ Return via the manage_non_medical_human function.
     [HttpPost("human_non_medical")]
     public async Task<ActionResult<HumanNonMedicalManagementResponse>> NonMedicalAsync(HumanNonMedicalManagementRequest req)
     {
-        if (!await DatabaseHelper.PasswordExistsAsync(req.Password))
-            return Unauthorized("Invalid password");
-        if (string.IsNullOrWhiteSpace(req.ClinicalNotes) || string.IsNullOrWhiteSpace(req.Diagnosis))
-            return BadRequest("Missing notes or diagnosis.");
+        if (await ValidatePasswordAsync(req.Password) is ActionResult err)
+            return err;
+        if (ValidateNotesAndDiagnosis(req.ClinicalNotes, req.Diagnosis) is ActionResult bad)
+            return bad;
         try
         {
             var userBlob = $"CLINICAL_NOTES:\n{req.ClinicalNotes}\n\nDIAGNOSIS: {req.Diagnosis}";
-            var resultJson = await _ai.GetChatCompletionAsync(
-                new[]
-                {
-                    new ChatMessage(ChatRole.System, NONMEDICAL_SYS),
-                    new ChatMessage(ChatRole.User, userBlob)
-                },
-                tools: new[] { NONMEDICAL_TOOL_HUMAN },
+            var resultJson = await CallOpenAiAsync(
+                NONMEDICAL_SYS,
+                userBlob,
+                tool: NONMEDICAL_TOOL_HUMAN,
                 functionName: "manage_non_medical_human");
             var parsed = JsonSerializer.Deserialize<HumanNonMedicalManagementResponse>(resultJson);
             var respJson = JsonSerializer.Serialize(parsed);

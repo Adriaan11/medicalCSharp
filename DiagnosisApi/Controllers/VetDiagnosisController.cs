@@ -19,6 +19,34 @@ public class VetDiagnosisController : ControllerBase
         _ai = ai;
     }
 
+    private async Task<ActionResult?> ValidateRequestAsync(DiagnosisRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.Text))
+            return BadRequest("Request 'text' is empty");
+        if (!await DatabaseHelper.PasswordExistsAsync(req.Password))
+            return Unauthorized("Invalid password");
+        return null;
+    }
+
+    private async Task<string> CallOpenAiAsync(
+        string systemPrompt,
+        string userPrompt,
+        float temperature = 0.2f,
+        ChatCompletionsFunctionToolDefinition? tool = null,
+        string? functionName = null)
+    {
+        var tools = tool == null ? null : new[] { tool };
+        return await _ai.GetChatCompletionAsync(
+            new[]
+            {
+                new ChatMessage(ChatRole.System, systemPrompt),
+                new ChatMessage(ChatRole.User, userPrompt)
+            },
+            temperature,
+            tools,
+            functionName);
+    }
+
     private const string VET_GUIDELINES = """
 Veterinary Quick Reference:
 1. Common acute abdomen causes: GI foreign body, GDV, septic peritonitis, intestinal obstruction.
@@ -171,39 +199,28 @@ Return ONLY the JSON via the diagnose function. Do NOT add explanatory prose.
     [HttpPost]
     public async Task<ActionResult<DiagnosisResponse>> DiagnoseAsync(DiagnosisRequest req)
     {
-        if (!await DatabaseHelper.PasswordExistsAsync(req.Password))
-            return Unauthorized("Invalid password");
-        if (string.IsNullOrWhiteSpace(req.Text))
-            return BadRequest("Request 'text' is empty");
+        if (await ValidateRequestAsync(req) is ActionResult error)
+            return error;
         try
         {
-            var summaryJson = await _ai.GetChatCompletionAsync(
-                new[]
-                {
-                    new ChatMessage(ChatRole.System, SYS_EXTRACT),
-                    new ChatMessage(ChatRole.User, req.Text)
-                },
-                tools: new[] { EXTRACT_TOOL_VET },
+            var summaryJson = await CallOpenAiAsync(
+                SYS_EXTRACT,
+                req.Text,
+                tool: EXTRACT_TOOL_VET,
                 functionName: "extract_features");
             using var summaryDoc = JsonDocument.Parse(summaryJson);
-            var diagJson = await _ai.GetChatCompletionAsync(
-                new[]
-                {
-                    new ChatMessage(ChatRole.System, SYS_DIAGNOSE),
-                    new ChatMessage(ChatRole.User, summaryJson)
-                },
+            var diagJson = await CallOpenAiAsync(
+                SYS_DIAGNOSE,
+                summaryJson,
                 0.3f,
-                new[] { DIAGNOSE_TOOL_VET },
+                DIAGNOSE_TOOL_VET,
                 "diagnose");
             var preds = JsonSerializer.Deserialize<DiagnosisResponse>(diagJson)?.Diagnoses ?? new();
-            var refineJson = await _ai.GetChatCompletionAsync(
-                new[]
-                {
-                    new ChatMessage(ChatRole.System, META_REVIEW),
-                    new ChatMessage(ChatRole.User, $"ORIGINAL_VETERINARY_RECORD:\n{req.Text}\n\nINITIAL_DIFFERENTIAL_JSON:\n{JsonSerializer.Serialize(new DiagnosisResponse{ Diagnoses = preds })}")
-                },
+            var refineJson = await CallOpenAiAsync(
+                META_REVIEW,
+                $"ORIGINAL_VETERINARY_RECORD:\n{req.Text}\n\nINITIAL_DIFFERENTIAL_JSON:\n{JsonSerializer.Serialize(new DiagnosisResponse{ Diagnoses = preds })}",
                 0.2f,
-                new[] { DIAGNOSE_TOOL_VET },
+                DIAGNOSE_TOOL_VET,
                 "diagnose");
             preds = JsonSerializer.Deserialize<DiagnosisResponse>(refineJson)?.Diagnoses ?? new();
             preds = ApplyHeuristics(preds, summaryDoc.RootElement);

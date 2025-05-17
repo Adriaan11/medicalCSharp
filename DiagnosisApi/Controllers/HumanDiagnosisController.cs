@@ -18,9 +18,54 @@ public class HumanDiagnosisController : ControllerBase
         _ai = ai;
     }
 
-    private const string SYS_EXTRACT = "You are HumanGPT, an expert clinical scribe. Extract JSON.";
-    private const string SYS_DIAGNOSE = "You are a clinical-decision assistant for physicians. Return JSON differential.";
-    private const string META_REVIEW = "You are a senior physician reviewer supervising an AI assistant. Return JSON only.";
+    private const string HUMAN_GUIDELINES = """
+Human Quick Reference:
+1. Severe sepsis indicators: altered mental status, hypotension, elevated lactate.
+2. Stroke: acute neurological deficit with imaging confirmation or high suspicion.
+3. Myocardial infarction: typical chest pain, ECG changes, elevated troponin.
+4. Surgeries are indicated if there's perforation, hemorrhage, or acute abdomen requiring intervention.
+INTERNAL REASONING: reason step-by-step privately; do not reveal chain-of-thought.
+""";
+
+    private static readonly string SYS_EXTRACT = $"""
+You are HumanGPT, an expert clinical scribe. Refer to the guidelines:
+{HUMAN_GUIDELINES}
+Task: read the raw clinical note below and output a JSON object with:
+  • demographics
+  • symptoms
+  • exam_findings
+  • lab_results
+  • imaging
+  • treatments
+Only include data explicitly present in the note.
+Return via the extract_features_human function.
+""";
+
+    private static readonly string SYS_DIAGNOSE = $"""
+You are a clinical-decision assistant for physicians. Refer to these guidelines:
+{HUMAN_GUIDELINES}
+Rules:
+1. Propose 1-5 plausible differential diagnoses.
+2. EACH must cite ≥2 specific findings from the note.
+3. Suggest 1-3 evidence-based first-line treatments per diagnosis.
+4. Highlight surgical/life-threatening conditions if supported.
+5. Down-rank diagnoses contradicted by negative/normal findings.
+INTERNAL REASONING: reason step-by-step privately, do not show chain-of-thought.
+Return JSON via the diagnose_human function with fields:
+  diagnosis, confidence (0-1), reason, treatments[].
+""";
+
+    private const string META_REVIEW = """
+You are a senior physician reviewer supervising an AI assistant.
+Tasks:
+1. Review the ORIGINAL clinical note and the AI's INITIAL differential JSON.
+2. Identify missing or mis-prioritised diagnoses, absent severity grading, or key treatment omissions/contraindications.
+3. Produce an improved differential: max 5 diagnoses, each with ≥2 explicit findings from the note and 1-3 first-line treatments. Adjust confidence (0-1) as needed.
+4. Explicitly consider syndromes that integrate abnormal labs and weigh them against infection.
+5. If imaging shows bilateral non-lobar opacities without fever ≥38.0 °C, suggest non-infectious causes (e.g. pulmonary oedema) before pneumonia.
+6. Keep identical JSON schema (diagnoses[ diagnosis, confidence, reason, treatments ]).
+Return ONLY the JSON via the diagnose_human function. Do NOT add explanatory prose.
+""";
 
     private static readonly string[] _EMERGENT_KEYWORDS = new[]
     {
@@ -33,31 +78,99 @@ public class HumanDiagnosisController : ControllerBase
         new(new FunctionDefinition("extract_features_human")
         {
             Description = "Extract structured features from a human clinical note.",
-            Parameters = BinaryData.FromObjectAsJson(new { type = "object" })
+            Parameters = BinaryData.FromString(
+            """
+{
+  "type": "object",
+  "properties": {
+    "demographics": {"type": "string"},
+    "symptoms": {"type": "array", "items": {"type": "string"}},
+    "exam_findings": {"type": "array", "items": {"type": "string"}},
+    "lab_results": {"type": "array", "items": {"type": "string"}},
+    "imaging": {"type": "array", "items": {"type": "string"}},
+    "treatments": {"type": "array", "items": {"type": "string"}}
+  }
+}
+""")
         });
 
     private static readonly ChatCompletionsFunctionToolDefinition DIAGNOSE_TOOL_HUMAN =
         new(new FunctionDefinition("diagnose_human")
         {
             Description = "Return possible human differential diagnoses.",
-            Parameters = BinaryData.FromObjectAsJson(new { type = "object" })
+            Parameters = BinaryData.FromString(
+            """
+{
+  "type": "object",
+  "properties": {
+    "diagnoses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "diagnosis": {"type": "string"},
+          "confidence": {"type": "number"},
+          "reason": {"type": "string"},
+          "treatments": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["diagnosis", "confidence", "reason", "treatments"]
+      },
+      "minItems": 1,
+      "maxItems": 5
+    }
+  },
+  "required": ["diagnoses"]
+}
+""")
         });
 
     private static readonly ChatCompletionsFunctionToolDefinition INVESTIGATE_TOOL_HUMAN =
         new(new FunctionDefinition("investigate_human")
         {
-            Description = "Return recommended investigations.",
-            Parameters = BinaryData.FromObjectAsJson(new { type = "object" })
+            Description = "Return recommended investigations (diagnostic tests) as an array of strings.",
+            Parameters = BinaryData.FromString(
+            """
+{
+  "type": "object",
+  "properties": {
+    "investigations": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["investigations"]
+}
+""")
         });
 
     private static readonly ChatCompletionsFunctionToolDefinition NONMEDICAL_TOOL_HUMAN =
         new(new FunctionDefinition("manage_non_medical_human")
         {
-            Description = "Return non-medical management suggestions.",
-            Parameters = BinaryData.FromObjectAsJson(new { type = "object" })
+            Description = "Return recommended non-medical management suggestions as an array of strings.",
+            Parameters = BinaryData.FromString(
+            """
+{
+  "type": "object",
+  "properties": {
+    "management": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["management"]
+}
+""")
         });
-    private const string INVESTIGATION_SYS = "You are a clinical decision support assistant. Return JSON investigations.";
-    private const string NONMEDICAL_SYS = "You are a clinical decision support assistant. Return JSON non-medical management.";
+    private const string INVESTIGATION_SYS = """
+You are a clinical decision support assistant. The user provides:
+1) Original clinical notes
+2) A specific diagnosis
+Return a JSON object with an array 'investigations' listing recommended diagnostic investigations or labs to confirm/assess the given diagnosis. Provide 3-7 suggestions.
+Name only the relevant tests. Do NOT include chain-of-thought.
+Return via the investigate_human function.
+""";
+    private const string NONMEDICAL_SYS = """
+You are a clinical decision support assistant. The user provides:
+1) Original clinical notes
+2) A specific diagnosis
+Return a JSON object with an array 'management' listing non-medical management suggestions (e.g. lifestyle, dietary changes, supportive care) for the specific diagnosis. Provide 3-7 suggestions.
+Do NOT include chain-of-thought.
+Return via the manage_non_medical_human function.
+""";
 
     private static List<HumanDiagnosisItem> ApplyHeuristics(List<HumanDiagnosisItem> preds, JsonElement summary)
     {

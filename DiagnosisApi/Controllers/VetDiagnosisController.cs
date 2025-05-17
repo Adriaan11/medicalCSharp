@@ -19,9 +19,56 @@ public class VetDiagnosisController : ControllerBase
         _ai = ai;
     }
 
-    private const string SYS_EXTRACT = "You are VetGPT, an expert medical scribe. Extract JSON from the note.";
-    private const string SYS_DIAGNOSE = "You are a veterinary clinical-decision assistant. Return JSON differential.";
-    private const string META_REVIEW = "You are a senior veterinary reviewer supervising an AI assistant. Return JSON only.";
+    private const string VET_GUIDELINES = """
+Veterinary Quick Reference:
+1. Common acute abdomen causes: GI foreign body, GDV, septic peritonitis, intestinal obstruction.
+2. Key parvovirus signs: hemorrhagic diarrhea, low WBC, vomiting, positive parvo test.
+3. Sepsis often includes tachycardia, hypotension (shock), fever, bounding pulses or weak pulses.
+4. Surgical emergencies: GDV, ruptured GI tract, severe hemorrhage, septic peritonitis, foreign object that can't pass.
+5. Always confirm negative test results before excluding infectious diseases.
+INTERNAL REASONING: reason step-by-step privately; do not reveal chain-of-thought.
+""";
+
+    private static readonly string SYS_EXTRACT = $"""
+You are VetGPT, an expert medical scribe. Use the guidelines below to inform your extraction:
+{VET_GUIDELINES}
+Task: read the raw veterinary record below and output a JSON object with:
+  • signalment
+  • imaging
+  • surgical_procedures
+  • test_results
+  • treatments
+  • other_clinical_clues
+Only include information explicitly present in the text. Omit null fields.
+Return via the extract_features function.
+""";
+
+    private static readonly string SYS_DIAGNOSE = $"""
+You are a veterinary clinical-decision assistant. Refer to the guidelines below:
+{VET_GUIDELINES}
+Rules:
+1. Propose 1-5 plausible differential diagnoses.
+2. EACH diagnosis must be backed by ≥2 distinct positive findings.
+3. Assume a test is NEGATIVE unless stated otherwise.
+4. If imaging + surgery + broad-spectrum IV antibiotics all appear,
+   give higher confidence to surgical conditions.
+5. Down-rank or discard diagnoses whose required test is negative.
+INTERNAL REASONING: reason step-by-step privately, do not show chain-of-thought in final answer.
+Return JSON via the diagnose function with fields:
+  diagnosis, confidence (0-1), reason.
+""";
+
+    private const string META_REVIEW = """
+You are a senior veterinary reviewer supervising an AI assistant.
+Tasks:
+1. Review the ORIGINAL VETERINARY RECORD and the AI's INITIAL differential JSON.
+2. Identify missing or mis-prioritized diagnoses, or key treatments (especially antibiotic or surgical) that may be missing or incorrectly recommended.
+3. Produce an improved differential: max 5 diagnoses, each with ≥2 explicit findings from the note and reasons for confidence. Keep confidence 0-1.
+4. Increase confidence for surgical emergencies (e.g. GDV, foreign body, septic peritonitis) if test results, imaging, or surgeries were done.
+5. Down-rank diagnoses contradicted by negative tests (e.g. parvo test negative).
+6. Keep identical JSON schema (diagnoses[ diagnosis, confidence, reason ]).
+Return ONLY the JSON via the diagnose function. Do NOT add explanatory prose.
+""";
 
     private static readonly Regex ANTIBIOTIC_PATTERN = new(
         @"\b(cef|cefazolin|amox|clav|augmentin|enroflox|baytril|metro|metronidazole)\w*",
@@ -38,14 +85,49 @@ public class VetDiagnosisController : ControllerBase
         new(new FunctionDefinition("extract_features")
         {
             Description = "Extract structured features from a vet record.",
-            Parameters = BinaryData.FromObjectAsJson(new { type = "object" })
+            Parameters = BinaryData.FromString(
+            """
+{
+  "type": "object",
+  "properties": {
+    "signalment": {"type": "string"},
+    "imaging": {"type": "array", "items": {"type": "string"}},
+    "surgical_procedures": {"type": "array", "items": {"type": "string"}},
+    "test_results": {"type": "object"},
+    "treatments": {"type": "array", "items": {"type": "string"}},
+    "other_clinical_clues": {"type": "array", "items": {"type": "string"}}
+  }
+}
+""")
         });
 
     private static readonly ChatCompletionsFunctionToolDefinition DIAGNOSE_TOOL_VET =
         new(new FunctionDefinition("diagnose")
         {
             Description = "Return possible veterinary diagnoses.",
-            Parameters = BinaryData.FromObjectAsJson(new { type = "object" })
+            Parameters = BinaryData.FromString(
+            """
+{
+  "type": "object",
+  "properties": {
+    "diagnoses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "diagnosis": {"type": "string"},
+          "confidence": {"type": "number"},
+          "reason": {"type": "string"}
+        },
+        "required": ["diagnosis", "confidence", "reason"]
+      },
+      "minItems": 1,
+      "maxItems": 5
+    }
+  },
+  "required": ["diagnoses"]
+}
+""")
         });
 
     private static List<DiagnosisItem> ApplyHeuristics(List<DiagnosisItem> preds, JsonElement summary)

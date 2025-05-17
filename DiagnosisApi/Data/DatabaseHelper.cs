@@ -4,7 +4,9 @@ namespace DiagnosisApi.Data;
 
 public static class DatabaseHelper
 {
-    private const string ConnectionString = "Server=localhost\\SQLEXPRESS;Database=DiagnosisDB;Trusted_Connection=True;";
+    private static readonly string ConnectionString =
+        Environment.GetEnvironmentVariable("DIAGNOSIS_DB_CONNECTION") ??
+        "Server=localhost\\SQLEXPRESS;Database=DiagnosisDB;Trusted_Connection=True;";
 
     public static async Task<bool> PasswordExistsAsync(string password)
     {
